@@ -1,6 +1,8 @@
 """Bốn provider cùng một interface. Không chứa agent loop."""
 import json
 import os
+import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -12,16 +14,35 @@ CONFIG = {
 }
 
 
+RETRY_CODES = (429, 500, 502, 503)  
+MAX_RETRIES = 5
+
+
 def post_json(url, headers, payload):
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json', **headers})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as exc:
-        # Do not print response bodies: they may contain account or request data.
-        raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
+    data = json.dumps(payload).encode()
+    for attempt in range(MAX_RETRIES + 1):
+        req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json', **headers})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            if exc.code in RETRY_CODES and attempt < MAX_RETRIES:
+                # Ưu tiên Retry-After của server; không có thì chờ tăng dần 5, 10, 20, 40, 60 giây.
+                retry_after = exc.headers.get('Retry-After') if exc.headers else None
+                wait = float(retry_after) if retry_after and retry_after.isdigit() else min(5 * 2 ** attempt, 60)
+                print(f'[provider] HTTP {exc.code}, chờ {wait:.0f}s rồi thử lại ({attempt + 1}/{MAX_RETRIES})', file=sys.stderr, flush=True)
+                time.sleep(wait)
+                continue
+            # Do not print response bodies: they may contain account or request data.
+            raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+            # Lỗi mạng tạm thời (timeout, mất kết nối): cũng chờ rồi thử lại.
+            if attempt < MAX_RETRIES:
+                wait = min(5 * 2 ** attempt, 60)
+                print(f'[provider] Lỗi mạng ({type(exc).__name__}), chờ {wait}s rồi thử lại ({attempt + 1}/{MAX_RETRIES})', file=sys.stderr, flush=True)
+                time.sleep(wait)
+                continue
+            raise RuntimeError(f'Không kết nối được provider: {getattr(exc, "reason", exc)}') from exc
 
 
 class Provider:
